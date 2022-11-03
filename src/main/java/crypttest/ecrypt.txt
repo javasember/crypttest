@@ -1,0 +1,248 @@
+import javax.crypto.*;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+import java.io.ByteArrayInputStream;
+import java.math.BigInteger;
+import java.security.*;
+import java.security.cert.*;
+import java.security.cert.Certificate;
+import java.security.interfaces.ECPrivateKey;
+import java.security.interfaces.ECPublicKey;
+import java.security.spec.*;
+import java.util.ArrayList;
+import java.util.List;
+
+import static javax.xml.bind.DatatypeConverter.parseHexBinary;
+
+/**
+ * ECDH, secp256r1, AES/GCM/NoPadding
+ */
+public class CryptoService {
+
+    /**
+     * Generate ephemeral ECDH keypair with secp256r1
+     * @return a random KeyPair
+     */
+    public KeyPair generateKeyPair() {
+        try {
+            var kpg = KeyPairGenerator.getInstance("EC");
+            kpg.initialize(256);
+            return kpg.generateKeyPair();
+        } catch (NoSuchAlgorithmException e) {
+            throw new RuntimeException("secp256r1 is not available", e);
+        }
+    }
+
+    /**
+     * Parse a hexadecimal string as an EC private key
+     * @param key the S value of the private key
+     * @return ECPrivateKey
+     * @throws InvalidKeySpecException if the parameter is not a valid private key according to secp256r1
+     */
+    public ECPrivateKey parsePrivateKey(String key) throws InvalidKeySpecException {
+        try {
+            var kf = KeyFactory.getInstance("EC");
+            var parameters = AlgorithmParameters.getInstance("EC", "SunEC");
+            parameters.init(new ECGenParameterSpec("secp256r1"));
+            var params = parameters.getParameterSpec(ECParameterSpec.class);
+
+            var pkSpec = new ECPrivateKeySpec(new BigInteger(key, 16), params);
+            return (ECPrivateKey) kf.generatePrivate(pkSpec);
+        } catch (NoSuchAlgorithmException | NoSuchProviderException | InvalidParameterSpecException e) {
+            throw new RuntimeException("secp256r1 via SunEC is not available", e);
+        }
+    }
+
+    /**
+     * Parse a hexadecimal string as a public key
+     * @param key hexadecimal string, the encrypted EC Point in uncompressed form
+     * @return the public key instance
+     * @throws InvalidKeySpecException if the key is invalid according to secp256r1
+     */
+    public ECPublicKey parsePublicKey(String key) throws InvalidKeySpecException {
+        try {
+            var kf = KeyFactory.getInstance("EC");
+            var parameters = AlgorithmParameters.getInstance("EC", "SunEC");
+            parameters.init(new ECGenParameterSpec("secp256r1"));
+            var params = parameters.getParameterSpec(ECParameterSpec.class);
+
+            var publicPoint = decodeECPoint(key);
+            var pubSpec = new ECPublicKeySpec(publicPoint, params);
+            return (ECPublicKey) kf.generatePublic(pubSpec);
+        } catch (NoSuchAlgorithmException | NoSuchProviderException | InvalidParameterSpecException e) {
+            throw new RuntimeException("secp256r1 via SunEC is not available", e);
+        }
+    }
+
+    /**
+     * Decode an ECPoint Q coming in uncompressed form - public key
+     * @param q hexadecimal string, the encoded ECPoint in uncompressed form
+     * @return the ECPoint constructed from the string value
+     */
+    public ECPoint decodeECPoint(String q) {
+        try {
+            var data = q.substring(2);
+            var half = data.length() / 2;
+            var x = data.substring(0, half);
+            var y = data.substring(half);
+
+            return new ECPoint(new BigInteger(x, 16), new BigInteger(y, 16));
+        } catch (Exception e) {
+            throw new IllegalArgumentException();
+        }
+    }
+
+    /**
+     * Create shared secret via key agreement
+     * @param senderPrivateKey the sender system's encryption private key
+     * @param receiverPublicKey the receiver ephemeral public key
+     * @return the shared secret from the key agreement
+     * @throws InvalidKeyException if any of the keys was invalid
+     */
+    public byte[] generateSharedSecret(PrivateKey senderPrivateKey,
+                                       PublicKey  receiverPublicKey) throws InvalidKeyException {
+        try {
+            var ka = KeyAgreement.getInstance("ECDH");
+            ka.init(senderPrivateKey);
+            ka.doPhase(receiverPublicKey, true);
+
+            return ka.generateSecret();
+        } catch (NoSuchAlgorithmException e) {
+            throw new RuntimeException("ECDH algorithm is not available", e);
+        }
+    }
+
+    /**
+     * Create symmetric key for AES-128
+     * @param secret the shared secret
+     * @param senderPublicKey the sender's ephemeral public key
+     * @param receiverPublicKey the receiver system's public encryption key
+     * @return AES key for (un)encryption
+     */
+    public byte[] createDerivedKey(byte[]      secret,
+                                   ECPublicKey senderPublicKey,
+                                   ECPublicKey receiverPublicKey) {
+        try {
+            var hash = MessageDigest.getInstance("SHA-256");
+            hash.update(secret);
+            hash.update(new byte[]{0, 0, 0, 1});
+            hash.update(encode(senderPublicKey));
+            hash.update(encode(receiverPublicKey));
+
+            return hash.digest();
+        } catch (NoSuchAlgorithmException e) {
+            throw new RuntimeException("SHA-256 algorithm is not available", e);
+        }
+    }
+
+    /**
+     * Encrypt content with AES-128-GCM-NoPadding
+     * @param derivedKey the AES-128 encryption key
+     * @param content the content ot encrypt
+     * @return the encrypted content
+     */
+    public byte[] encrypt(byte[] derivedKey,
+                          byte[] content) {
+        try {
+            var aesKey = new SecretKeySpec(derivedKey, 0, 16, "AES");
+            var initVector = new GCMParameterSpec(128, derivedKey, 16, 16);
+            var cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(Cipher.ENCRYPT_MODE, aesKey, initVector);
+            return cipher.doFinal(content);
+        } catch (NoSuchAlgorithmException
+                | NoSuchPaddingException e) {
+            throw new RuntimeException("AES/GCM/NoPadding algorithm is not available", e);
+        } catch (InvalidKeyException
+                | InvalidAlgorithmParameterException
+                | IllegalBlockSizeException
+                | BadPaddingException e) {
+            throw new RuntimeException("The encryption key is invalid", e);
+        }
+    }
+
+    /**
+     * Encode the EC point of the public key by using the uncompressed hexadecimal form "04{x-coord}{y-coord}"
+     * @param key the key to serialize
+     * @return the byte array of the encoded hexadecimal string
+     */
+    public byte[] encode(ECPublicKey key) {
+        var p = key.getW();
+        var s = "04" + p.getAffineX().toString(16) + p.getAffineY().toString(16);
+        return parseHexBinary(s);
+    }
+
+    /**
+     * Decrypt the incoming data package using AES-128/GCM/NoPadding and ECDH key agreement
+     * @param sharedSecret the secret coming w/ the encrypted content
+     * @param data the encrypted content
+     * @param receiverPublicKey the public key of the receiving system ()
+     * @param senderPublicKey the public key of the sender (ephemeral)
+     * @return the decrypted content
+     */
+    public byte[] decrypt(byte[] sharedSecret,
+                          byte[] data,
+                          ECPublicKey receiverPublicKey,
+                          ECPublicKey senderPublicKey) {
+        try {
+            var derivedKey = createDerivedKey(sharedSecret, receiverPublicKey, senderPublicKey);
+            var aesKey = new SecretKeySpec(derivedKey, 0, 16, "AES");
+            var initVector = new GCMParameterSpec(128, derivedKey, 16, 16);
+            var cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(Cipher.DECRYPT_MODE, aesKey, initVector);
+            return cipher.doFinal(data);
+        } catch (NoSuchAlgorithmException
+                | NoSuchPaddingException e) {
+            throw new RuntimeException("AES/GCM/NoPadding algorithm is not available", e);
+        } catch (InvalidKeyException
+                | InvalidAlgorithmParameterException
+                | IllegalBlockSizeException
+                | BadPaddingException e) {
+            throw new RuntimeException("The encryption key is invalid", e);
+        }
+    }
+
+    /**
+     * Encrypt data package using AES-128/GCM/NoPadding and ECDH key agreement
+     * @param data data to be encrypted
+     * @param senderKeyPair ephemeral key pair of the sender
+     * @param receiverPublicKey the public key of the receiving system
+     * @return the encrypted data
+     */
+    public byte[] encrypt(byte[] data, KeyPair senderKeyPair, ECPublicKey receiverPublicKey) {
+        try {
+            var senderPublicKey  = (ECPublicKey)  senderKeyPair.getPublic();
+            var senderPrivateKey = (ECPrivateKey) senderKeyPair.getPrivate();
+
+            var sharedSecret = generateSharedSecret(senderPrivateKey, receiverPublicKey);
+            var derivedKey   = createDerivedKey(sharedSecret, senderPublicKey, receiverPublicKey);
+            return encrypt(derivedKey, data);
+        } catch (InvalidKeyException e) {
+            throw new RuntimeException("The encryption key is invalid", e);
+        }
+    }
+
+    public void checkCertificateChain(List<byte[]> certChain) {
+        try {
+            var certFactory  = CertificateFactory.getInstance("X.509");
+            var certificates = new ArrayList<Certificate>(certChain.size());
+
+            for (var c : certChain)
+                certificates.add(certFactory.generateCertificate(new ByteArrayInputStream(c)));
+
+            var certPath  = certFactory.generateCertPath(certificates);
+            var validator = CertPathValidator.getInstance("PKIX");
+
+            // new PKIXParameters(...)
+            validator.validate(certPath, null);
+        } catch (CertificateException
+                | NoSuchAlgorithmException
+                | CertPathValidatorException
+                | InvalidAlgorithmParameterException e) {
+            throw new RuntimeException("Chain validation error", e);
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+
+    }
+}
