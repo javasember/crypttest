@@ -1,0 +1,99 @@
+import java.math.BigInteger;
+import java.util.Arrays;
+
+import org.apache.commons.lang3.RandomStringUtils;
+import org.bouncycastle.asn1.nist.NISTNamedCurves;
+import org.bouncycastle.asn1.x9.X9ObjectIdentifiers;
+import org.bouncycastle.crypto.AsymmetricCipherKeyPair;
+import org.bouncycastle.crypto.generators.ECKeyPairGenerator;
+import org.bouncycastle.crypto.generators.SCrypt;
+import org.bouncycastle.crypto.params.ECDomainParameters;
+import org.bouncycastle.crypto.params.ECKeyGenerationParameters;
+import org.bouncycastle.crypto.params.ECPublicKeyParameters;
+import org.bouncycastle.crypto.prng.FixedSecureRandom;
+import org.bouncycastle.util.encoders.Hex;
+import org.springframework.stereotype.Service;
+
+import com.valeo.paak.service.pairing.model.PairingPassword;
+import com.valeo.paak.service.pairing.model.Verifier;
+
+import liquibase.repackaged.org.apache.commons.lang3.tuple.ImmutablePair;
+import lombok.RequiredArgsConstructor;
+
+@Service
+@RequiredArgsConstructor
+public class CryptoService {
+    private final CryptoConfig cfg;
+
+    /**
+     * password generation according to CCC section 18.4
+     */
+    public PairingPassword generate() {
+        var password = RandomStringUtils.randomNumeric(cfg.getPasswordSize());
+        var salt     = RandomStringUtils.randomAlphanumeric(cfg.getSaltSize());
+
+        return createByKeyPair(password, salt);
+    }
+
+    public PairingPassword generate(String password) {
+        var salt = RandomStringUtils.randomAlphanumeric(cfg.getSaltSize());
+
+        return createByKeyPair(password, salt);
+    }
+
+    public PairingPassword regenerate(PairingPassword pwd) {
+        var password = pwd.getPassword();
+        var salt     = pwd.getSalt();
+
+        return createByMultiplication(password, salt);
+    }
+
+    public PairingPassword createByKeyPair(String password,  String salt) {
+        var w = createSecrets(password, salt);
+
+        var keyPair   = calculateKeyPair(w.getRight());
+        var publicKey = (ECPublicKeyParameters) keyPair.getPublic();
+        
+        var L = Hex.toHexString(publicKey.getQ().getXCoord().getEncoded()) + Hex.toHexString(publicKey.getQ().getYCoord().getEncoded());
+
+        return new PairingPassword(null, password, new Verifier(w.getLeft().toString(16), L), salt, null);
+    }
+
+    public PairingPassword createByMultiplication(String password,  String salt) {
+        var curve = NISTNamedCurves.getByOID(X9ObjectIdentifiers.prime256v1);
+
+        var w     = createSecrets(password, salt);
+        var point = curve.getG().multiply(w.getRight()).normalize();
+        // create the non-compressed encoded string from the point
+        var L     = "04" + Hex.toHexString(point.getXCoord().getEncoded()) + Hex.toHexString(point.getYCoord().getEncoded());
+
+        return new PairingPassword(null, password, new Verifier(w.getLeft().toString(16), L), salt, null);
+    }
+
+    public ImmutablePair<BigInteger, BigInteger> createSecrets(String password,  String salt) {
+        var encrypted = SCrypt.generate(password.getBytes(), salt.getBytes(), cfg.getCpuCost(), cfg.getBlockSize(), cfg.getParallelization(), cfg.getOutputLength());
+
+        var z0 = new BigInteger(1, Arrays.copyOfRange(encrypted, 0, cfg.getOutputLength() / 2));
+        var z1 = new BigInteger(1, Arrays.copyOfRange(encrypted, cfg.getOutputLength() / 2, cfg.getOutputLength()));
+
+        var curve = NISTNamedCurves.getByOID(X9ObjectIdentifiers.prime256v1);
+        var n = curve.getN();
+
+        var w0 = z0.mod(n.subtract(BigInteger.ONE)).add(BigInteger.ONE);
+        var w1 = z1.mod(n.subtract(BigInteger.ONE)).add(BigInteger.ONE);
+
+        return new ImmutablePair<>(w0, w1);
+    }
+
+    public AsymmetricCipherKeyPair calculateKeyPair(BigInteger seed) {
+        var curve     = NISTNamedCurves.getByOID(X9ObjectIdentifiers.prime256v1);
+        var params    = new ECDomainParameters(curve);
+        var keyParams = new ECKeyGenerationParameters(params, new FixedSecureRandom(seed.toByteArray()));
+        var generator = new ECKeyPairGenerator();
+        generator.init(keyParams);
+
+        return generator.generateKeyPair();
+    }
+
+
+}
